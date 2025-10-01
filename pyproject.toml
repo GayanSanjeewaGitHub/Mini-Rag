@@ -1,0 +1,19 @@
+[project]
+name = "mini-rag"
+version = "0.1.0"
+description = "A lightweight Retrieval-Augmented Generation (RAG) system for movie plots"
+requires-python = ">=3.9"
+
+dependencies = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "sentence-transformers",
+    "openai",
+    "faiss-cpu",
+]
+
+[tool.uv]
+# optional: where uv should store the virtual environment
+# uncomment if you want a local `.venv`
+# venv = ".venv"
