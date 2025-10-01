@@ -1,91 +1,80 @@
-"""
-Mini RAG system (Movie Plots) - mini_rag.py
-
-This single-file script implements a minimal Retrieval-Augmented Generation (RAG)
-pipeline for answering questions about movie plots.
-
-Features:
-- Load a CSV of movie plots (expects columns: Title, Plot)
-- Sample a subset (default 300 rows)
-- Chunk long plots (~300 words per chunk)
-- Embed chunks (uses OpenAI embeddings if OPENAI_API_KEY is set; otherwise uses sentence-transformers)
-- Build an in-memory vector store (FAISS if available, otherwise sklearn NearestNeighbors brute force)
-- Retrieve top-k relevant chunks for a query
-- Generate an answer using an LLM (OpenAI if OPENAI_API_KEY provided, otherwise a simple template-based answer)
-- Output structured JSON: { answer, contexts, reasoning }
-
-Usage (example):
-python mini_rag.py --csv wiki_movie_plots.csv --rows 300 --k 5 --query "Which movie features an AI antagonist?"
-
-Dependencies:
-pip install -r requirements.txt
-
-requirements.txt (recommended):
-faiss-cpu        # optional, speeds retrieval
-sentence-transformers
-scikit-learn
-numpy
-pandas
-openai           # optional, for embeddings + LLM
-
-Notes:
-- If you want LLM generation, set OPENAI_API_KEY in env before running.
-- The script is intentionally simple and clear for a take-home assignment.
-
-"""
-
+#!/usr/bin/env python3
 from __future__ import annotations
 import argparse
 import json
+import logging
 import os
-import math
-from typing import List, Tuple, Dict, Any
+import sys
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
-# Try optional imports (faiss, openai). We'll gracefully degrade if unavailable.
-try:
-    import faiss
-    _HAS_FAISS = True
-except Exception:
-    _HAS_FAISS = False
-
-try:
-    from sentence_transformers import SentenceTransformer
-    _HAS_SBT = True
-except Exception:
-    _HAS_SBT = False
-
+# External SDKs
 try:
     import openai
-    _HAS_OPENAI = True
-except Exception:
-    _HAS_OPENAI = False
+except Exception as e:
+    raise RuntimeError("openai library is required. Install with `pip install openai`.") from e
 
-# fallback from scikit-learn for nearest neighbors
-from sklearn.neighbors import NearestNeighbors
+try:
+    import pinecone
+except Exception as e:
+    raise RuntimeError("pinecone-client library is required. Install with `pip install pinecone-client`.") from e
 
+ 
+LOG = logging.getLogger("mini_rag")
+LOG.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+handler.setFormatter(formatter)
+LOG.addHandler(handler)
 
-# ----------------------------- Helpers ---------------------------------
+ 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENV = os.getenv("PINECONE_ENV")  
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "mini-rag-movie")
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")  # adjust to available models
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "16"))
 
-def load_and_sample(csv_path: str, n: int = 300) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    # Expect columns Title and Plot (case-insensitive)
-    cols = {c.lower(): c for c in df.columns}
-    title_col = cols.get("title")
-    plot_col = cols.get("plot")
-    if title_col is None or plot_col is None:
-        raise ValueError("CSV must contain 'Title' and 'Plot' columns (case-insensitive).")
+if not OPENAI_API_KEY:
+    LOG.error("OPENAI_API_KEY environment variable not set.")
+    raise SystemExit(1)
+if not PINECONE_API_KEY:
+    LOG.error("PINECONE_API_KEY environment variable not set.")
+    raise SystemExit(1)
 
-    df = df[[title_col, plot_col]].rename(columns={title_col: "Title", plot_col: "Plot"})
-    df = df.dropna(subset=["Plot"])  # drop rows with no plot
-    if n and n < len(df):
-        df = df.sample(n, random_state=42).reset_index(drop=True)
-    return df.reset_index(drop=True)
+openai.api_key = OPENAI_API_KEY
 
+ 
+def retry(fn=None, *, retries=3, delay=1.0, backoff=2.0):
+    """Simple retry decorator (sync)."""
+    def deco(func):
+        def wrapper(*args, **kwargs):
+            _retries = retries
+            _delay = delay
+            last_exc = None
+            for i in range(_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    LOG.warning("Retry %d/%d after exception: %s", i + 1, _retries, e)
+                    time.sleep(_delay)
+                    _delay *= backoff
+            LOG.error("All retries failed for function %s", func.__name__)
+            raise last_exc
+        return wrapper
+    return deco if fn is None else deco(fn)
 
 def chunk_text(text: str, words_per_chunk: int = 300) -> List[str]:
+    """Split text on word boundaries into ~words_per_chunk chunks."""
+    if not text:
+        return []
     words = text.split()
     if len(words) <= words_per_chunk:
         return [text.strip()]
@@ -95,260 +84,292 @@ def chunk_text(text: str, words_per_chunk: int = 300) -> List[str]:
         chunks.append(chunk)
     return chunks
 
+ 
+@dataclass
+class PineconeConfig:
+    api_key: str
+    environment: str
+    index_name: str
+    dimension: int = 1536  
 
-def build_chunks(df: pd.DataFrame, words_per_chunk: int = 300) -> Tuple[List[str], List[Dict[str, Any]]]:
+class PineconeStore:
+    def __init__(self, cfg: PineconeConfig):
+        self.cfg = cfg
+        pinecone.init(api_key=cfg.api_key, environment=cfg.environment)
+        LOG.info("Connected to Pinecone environment=%s", cfg.environment)
+        self.index = self._ensure_index(cfg.index_name, cfg.dimension)
+        self._index = pinecone.Index(cfg.index_name)
+
+    def _ensure_index(self, name: str, dimension: int):
+        """Create index if not exists (sparse/no replicas by default)."""
+        try:
+            if name not in pinecone.list_indexes():
+                LOG.info("Creating Pinecone index '%s' (dim=%d)", name, dimension)
+                pinecone.create_index(name, dimension=dimension, metric="cosine")
+                # wait briefly
+                time.sleep(2)
+            else:
+                LOG.info("Pinecone index '%s' already exists", name)
+            return name
+        except Exception:
+            LOG.exception("Failed to ensure index present")
+            raise
+
+    @retry(retries=3, delay=1.0)
+    def upsert(self, vectors: List[Tuple[str, List[float], dict]]):
+        """Upsert list of (id, vector, metadata)."""
+        # Pinecone supports batch upsert (list of tuples)
+        try:
+            LOG.info("Upserting %d vectors to Pinecone index %s", len(vectors), self.cfg.index_name)
+            # convert to list of dicts if using client v2: but pinecone.Index.upsert accepts list of tuples
+            self._index.upsert(vectors=vectors)
+        except Exception:
+            LOG.exception("Pinecone upsert error")
+            raise
+
+    @retry(retries=3, delay=1.0)
+    def query(self, vector: List[float], top_k: int = 5) -> List[dict]:
+        """Query Pinecone index for top_k nearest neighbors. Returns list of {id, score, metadata}."""
+        try:
+            res = self._index.query(vector=vector, top_k=top_k, include_metadata=True, include_values=False)
+            matches = res.get("matches", [])
+            out = []
+            for m in matches:
+                out.append({"id": m["id"], "score": m.get("score", 0.0), "metadata": m.get("metadata", {})})
+            return out
+        except Exception:
+            LOG.exception("Pinecone query error")
+            raise
+
+# ------------------------------
+# OpenAI Helper
+# ------------------------------
+@retry(retries=3, delay=1.0)
+def embed_texts(texts: List[str], model: str = OPENAI_EMBED_MODEL) -> List[List[float]]:
+    """Call OpenAI embeddings API in batches."""
+    LOG.info("Embedding %d texts (model=%s)", len(texts), model)
+    embeddings = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i : i + EMBED_BATCH]
+        try:
+            resp = openai.Embedding.create(model=model, input=batch)
+        except Exception:
+            LOG.exception("OpenAI embedding call failed")
+            raise
+        for item in resp["data"]:
+            embeddings.append(item["embedding"])
+    return embeddings
+
+@retry(retries=3, delay=1.0)
+def generate_answer_with_references(query: str, snippets: List[str], model: str = OPENAI_CHAT_MODEL) -> Tuple[str, str]:
     """
-    Returns (texts, metadata_list)
-    metadata includes: title, chunk_index, original_row_index
-    """
-    texts: List[str] = []
-    metas: List[Dict[str, Any]] = []
-    for idx, row in df.iterrows():
-        title = str(row["Title"]) if pd.notna(row["Title"]) else ""
-        plot = str(row["Plot"]) if pd.notna(row["Plot"]) else ""
-        piece_list = chunk_text(plot, words_per_chunk)
-        for ci, piece in enumerate(piece_list):
-            texts.append(piece)
-            metas.append({"title": title, "chunk_index": ci, "row_index": int(idx)})
-    return texts, metas
-
-
-# --------------------------- Embeddings --------------------------------
-
-class Embedder:
-    def __init__(self, model_name: str | None = None):
-        self.openai_key = os.getenv("OPENAI_API_KEY")
-        self.use_openai = bool(self.openai_key) and _HAS_OPENAI
-        if self.use_openai:
-            openai.api_key = self.openai_key
-            # model choice for embeddings
-            self.model = model_name or "text-embedding-3-small"
-            print("Using OpenAI embeddings ->", self.model)
-        else:
-            # fallback to sentence-transformers
-            model_name = model_name or "all-MiniLM-L6-v2"
-            if not _HAS_SBT:
-                raise RuntimeError("No embedding backend available. Install openai or sentence-transformers.")
-            self.sbert = SentenceTransformer(model_name)
-            print("Using Sentence-Transformers embeddings ->", model_name)
-
-    def embed(self, texts: List[str]) -> np.ndarray:
-        if self.use_openai:
-            # Batch the requests (small batches)
-            embeddings: List[List[float]] = []
-            BATCH = 16
-            for i in range(0, len(texts), BATCH):
-                batch = texts[i : i + BATCH]
-                resp = openai.Embedding.create(model=self.model, input=batch)
-                batch_emb = [r["embedding"] for r in resp["data"]]
-                embeddings.extend(batch_emb)
-            return np.array(embeddings, dtype=np.float32)
-        else:
-            embs = self.sbert.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-            # Ensure float32
-            return embs.astype(np.float32)
-
-
-# --------------------------- Vector Store -------------------------------
-
-class VectorStore:
-    def __init__(self, embeddings: np.ndarray, metas: List[Dict[str, Any]]):
-        self.embeddings = embeddings
-        self.metas = metas
-        self.dim = embeddings.shape[1]
-
-        if _HAS_FAISS:
-            try:
-                self.index = faiss.IndexFlatIP(self.dim)
-                # normalize for cosine similarity
-                faiss.normalize_L2(self.embeddings)
-                self.index.add(self.embeddings)
-                self._use_faiss = True
-                print("FAISS index built.")
-            except Exception as e:
-                print("FAISS error, falling back:", e)
-                self._use_faiss = False
-                self._build_sklearn()
-        else:
-            self._use_faiss = False
-            self._build_sklearn()
-
-    def _build_sklearn(self):
-        # sklearn NearestNeighbors with cosine metric
-        self.nn = NearestNeighbors(metric="cosine", algorithm="brute")
-        self.nn.fit(self.embeddings)
-        print("Sklearn NearestNeighbors index built.")
-
-    def query(self, q_emb: np.ndarray, top_k: int = 5) -> List[Tuple[Dict[str, Any], float]]:
-        # q_emb shape (dim,) or (1,dim)
-        q = q_emb.reshape(1, -1).astype(np.float32)
-        if self._use_faiss:
-            # faiss expects normalized vectors for IP
-            faiss.normalize_L2(q)
-            D, I = self.index.search(q, top_k)
-            results = []
-            for score, idx in zip(D[0].tolist(), I[0].tolist()):
-                results.append((self.metas[idx], float(score)))
-            return results
-        else:
-            # sklearn returns distances (cosine), convert to similarity
-            dist, idxs = self.nn.kneighbors(q, n_neighbors=top_k)
-            results = []
-            for d, i in zip(dist[0].tolist(), idxs[0].tolist()):
-                sim = 1 - d  # cosine similarity
-                results.append((self.metas[i], float(sim)))
-            return results
-
-
-# ---------------------------- Retrieval ---------------------------------
-
-def retrieve(query: str, embedder: Embedder, store: VectorStore, top_k: int = 5) -> List[Dict[str, Any]]:
-    q_emb = embedder.embed([query])[0]
-    hits = store.query(q_emb, top_k=top_k)
-    # Build contexts (include snippet & metadata)
-    contexts = []
-    for meta, score in hits:
-        contexts.append({"title": meta["title"], "chunk_index": meta["chunk_index"], "score": score})
-    return contexts
-
-
-# --------------------------- LLM Generation ------------------------------
-
-def generate_answer_openai(query: str, contexts: List[Dict[str, Any]], texts: List[str]) -> Tuple[str, str]:
-    """
-    Use OpenAI ChatCompletion to generate answer + reasoning.
-    contexts: list of metas; texts: all chunk texts in same order as metas
+    Generate answer and reasoning. We craft a deterministic system+user prompt and ask model to return only JSON.
     Returns (answer, reasoning)
     """
-    # assemble context snippets (include short excerpt from texts based on row_index & chunk_index)
-    snippets = []
-    for c in contexts:
-        # attempt to find corresponding chunk text
-        idx = None
-        # find first matching meta in store
-        for i, m in enumerate(store_metas_glob):
-            if m["title"] == c["title"] and m["chunk_index"] == c["chunk_index"]:
-                idx = i
-                break
-        if idx is None:
-            snippets.append("")
-        else:
-            snippet_text = texts[idx]
-            snippets.append(snippet_text)
-
-    system_prompt = (
+    LOG.info("Generating answer via OpenAI chat model=%s", model)
+    system_msg = (
         "You are a helpful assistant that answers questions about movie plots. "
-        "Use the provided context snippets from Wikipedia movie plots to form a concise, accurate answer. "
-        "If not found, say you could not find a definitive answer."
+        "Use ONLY the provided context snippets (do not hallucinate). "
+        "If the answer is not contained in the snippets, be explicit and say you couldn't find it."
+    )
+    user_msg = f"Question: {query}\n\nContext snippets:\n"
+    for i, s in enumerate(snippets, start=1):
+        user_msg += f"[{i}] {s}\n\n"
+    user_msg += (
+        "Please provide a JSON object with keys: answer (one-3 sentences), reasoning (short explanation mentioning which snippets were used). "
+        "Return ONLY the JSON, and ensure it is parseable."
     )
 
-    user_prompt = f"Question: {query}\n\nContext snippets:\n"
-    for i, s in enumerate(snippets, 1):
-        user_prompt += f"[{i}] {s}\n\n"
-    user_prompt += "\nPlease provide:\n1) a short answer (1-3 sentences)\n2) a short reasoning explaining which contexts you used.\nReturn ONLY a JSON with keys: answer, reasoning."
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            temperature=0.0,
+            max_tokens=400,
+        )
+    except Exception:
+        LOG.exception("OpenAI chat completion failed")
+        raise
 
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-        temperature=0.0,
-        max_tokens=300,
-    )
     text = resp["choices"][0]["message"]["content"].strip()
-    # Attempt to parse JSON from model output
+    # Try parsing JSON; otherwise fallback simple heuristics
     try:
         parsed = json.loads(text)
-        return parsed.get("answer", ""), parsed.get("reasoning", "")
+        answer = parsed.get("answer", "")
+        reasoning = parsed.get("reasoning", "")
+        return answer, reasoning
     except Exception:
-        # If not JSON, split heuristically
-        parts = text.split("Reasoning:")
-        ans = parts[0].strip()
-        reason = parts[1].strip() if len(parts) > 1 else ""
-        return ans, reason
+        LOG.warning("Chat model did not return JSON - falling back to heuristic parsing")
+        # naive split: first paragraph = answer, rest = reasoning
+        parts = text.split("\n\n")
+        answer = parts[0].strip()
+        reasoning = "\n\n".join(parts[1:]).strip() if len(parts) > 1 else ""
+        return answer, reasoning
 
 
-def generate_answer_template(query: str, contexts: List[Dict[str, Any]], texts: List[str]) -> Tuple[str, str]:
-    """Fallback: simple template-based answer using the top context."""
-    if not contexts:
-        return "I couldn't find relevant movie plot information.", "No matching contexts returned by retrieval."
-    top = contexts[0]
-    # find text index
-    idx = None
-    for i, m in enumerate(store_metas_glob):
-        if m["title"] == top["title"] and m["chunk_index"] == top["chunk_index"]:
-            idx = i
-            break
-    snippet = texts[idx] if idx is not None else ""
-    # naive answer: mention title and snippet first sentence
-    first_sentence = snippet.split(".")[0].strip()
-    answer = f"The movie *{top['title']}* appears relevant. {first_sentence}."
-    reasoning = f"Top context is from '{top['title']}' (score={top['score']:.3f}). Used that plot snippet to form the answer."
-    return answer, reasoning
+import os
+import kagglehub
+import shutil
 
+def ensure_dataset(local_dir: str = "data"):
+    """
+    Ensure dataset exists locally. If the folder is empty, download from KaggleHub.
+    """
+    # Create local data dir if not exists
+    os.makedirs(local_dir, exist_ok=True)
 
-# ------------------------------- CLI -----------------------------------
+    # Check if the folder has files
+    if not os.listdir(local_dir):
+        print(" 'data/' folder is empty. Downloading dataset...")
+        path = kagglehub.dataset_download("jrobischon/wikipedia-movie-plots")
+        print(" Dataset downloaded to:", path)
 
+        # Copy dataset into local_dir
+        for item in os.listdir(path):
+            src = os.path.join(path, item)
+            dest = os.path.join(local_dir, item)
+
+            if os.path.isdir(src):
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dest)
+
+        print(f"📥 Dataset copied into '{local_dir}'")
+    else:
+        print(f"✅ Found existing dataset in '{local_dir}'")
+
+ 
+# ------------------------------
+# Core Pipeline
+# ------------------------------
+def build_chunks_from_csv(csv_path: str, sample_rows: int = 300, words_per_chunk: int = 300) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Loads CSV, samples rows, chunks plot texts, returns list of chunk texts and matching metadata.
+    metadata: { title, row_index, chunk_index, original_plot_preview }
+    """
+    LOG.info("Loading CSV: %s (sample=%s)", csv_path, sample_rows)
+    ensure_dataset("data")
+    df = pd.read_csv(csv_path)
+    # find title and plot columns case-insensitive
+    cols = {c.lower(): c for c in df.columns}
+    title_col = cols.get("title")
+    plot_col = cols.get("plot")
+    if title_col is None or plot_col is None:
+        LOG.error("CSV must contain 'Title' and 'Plot' columns (case-insensitive). Found: %s", list(df.columns))
+        raise ValueError("CSV must contain Title and Plot columns")
+
+    df = df[[title_col, plot_col]].rename(columns={title_col: "Title", plot_col: "Plot"})
+    df = df.dropna(subset=["Plot"])
+    if sample_rows and sample_rows < len(df):
+        df = df.sample(sample_rows, random_state=42).reset_index(drop=True)
+    texts = []
+    metas = []
+    for idx, row in df.iterrows():
+        title = str(row["Title"]) if pd.notna(row["Title"]) else ""
+        plot = str(row["Plot"])
+        chunks = chunk_text(plot, words_per_chunk=words_per_chunk)
+        for ci, c in enumerate(chunks):
+            texts.append(c)
+            metas.append({"title": title, "row_index": int(idx), "chunk_index": int(ci), "preview": c[:240]})
+    LOG.info("Built %d chunks from %d rows", len(texts), len(df))
+    return texts, metas
+
+def upsert_chunks_to_pinecone(store: PineconeStore, texts: List[str], metas: List[Dict[str, Any]], batch_size: int = 100):
+    """Compute embeddings and upsert into Pinecone in batches."""
+    LOG.info("Upserting chunks to Pinecone (batches of %d)", batch_size)
+    # compute embeddings in batches
+    for i in tqdm(range(0, len(texts), batch_size), desc="Upsert batches"):
+        batch_texts = texts[i : i + batch_size]
+        batch_metas = metas[i : i + batch_size]
+        emb_batch = embed_texts(batch_texts)
+        vectors = []
+        for j, emb in enumerate(emb_batch):
+            meta = batch_metas[j]
+            # create a stable id: e.g., title_row_chunk
+            # ensure id length limits for pinecone (should be safe)
+            safe_title = meta["title"].replace(" ", "_")[:50]
+            vec_id = f"{safe_title}_r{meta['row_index']}_c{meta['chunk_index']}"
+            vectors.append((vec_id, emb, meta))
+        store.upsert(vectors)
+
+def retrieve_contexts(store: PineconeStore, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Embed query, query Pinecone, and return ordered list of contexts (text + metadata + score)."""
+    q_emb = embed_texts([query])[0]
+    matches = store.query(q_emb, top_k=top_k)
+    # matches have metadata; we will return metadata plus score
+    LOG.info("Retrieved %d matches", len(matches))
+    return matches
+
+# ------------------------------
+# CLI / Main
+# ------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", required=True, help="Path to CSV containing Title and Plot columns")
-    p.add_argument("--rows", type=int, default=300, help="Number of rows to sample from CSV")
-    p.add_argument("--words_per_chunk", type=int, default=300, help="Words per chunk for splitting plots")
-    p.add_argument("--k", type=int, default=5, help="Top-k contexts to retrieve")
-    p.add_argument("--query", type=str, required=True, help="Query/question to ask the RAG system")
-    p.add_argument("--use_openai", action="store_true", help="Force using OpenAI for embeddings/LLM (requires OPENAI_API_KEY)")
+    p.add_argument("--csv", type=str, help="Path to wiki_movie_plots CSV" ,default="data")
+    p.add_argument("--rows", type=int, default=300, help="How many rows to sample for building index")
+    p.add_argument("--words_per_chunk", type=int, default=300, help="Words per chunk")
+    p.add_argument("--upsert", action="store_true", help="Run build+upsert into Pinecone")
+    p.add_argument("--query", type=str, help="Query to ask the RAG system (run after index exists)" , default="Which movie features an AI antagonist?")
+    p.add_argument("--top_k", type=int, default=5, help="Top-k contexts to retrieve")
+    p.add_argument("--batch_size", type=int, default=100, help="Upsert batch size")
     return p.parse_args()
-
 
 def main():
     args = parse_args()
+    # Validate env
+    if not OPENAI_API_KEY or not PINECONE_API_KEY:
+        LOG.error("OPENAI_API_KEY and PINECONE_API_KEY must be set.")
+        sys.exit(2)
 
-    df = load_and_sample(args.csv, n=args.rows)
-    print(f"Loaded {len(df)} rows from {args.csv}")
+    # initialize PineconeStore
+    # dimension: we assume 1536 for text-embedding-3-small. If you change model, update dimension accordingly.
+    cfg = PineconeConfig(api_key=PINECONE_API_KEY, environment=PINECONE_ENV or "", index_name=PINECONE_INDEX, dimension=1536)
+    store = PineconeStore(cfg)
 
-    texts, metas = build_chunks(df, words_per_chunk=args.words_per_chunk)
-    print(f"Created {len(texts)} chunks (words_per_chunk={args.words_per_chunk})")
+    # If user requested upsert: build chunks and upsert to pinecone
+    if args.upsert:
+        if not args.csv:
+            LOG.error("--csv must be provided when --upsert is used.")
+            sys.exit(2)
+        texts, metas = build_chunks_from_csv(args.csv, sample_rows=args.rows, words_per_chunk=args.words_per_chunk)
+        upsert_chunks_to_pinecone(store, texts, metas, batch_size=args.batch_size)
+        LOG.info("Upsert completed.")
+        return
 
-    # initialize embedder
-    embedder = Embedder()
-    embs = embedder.embed(texts)
-    print("Embeddings shape:", embs.shape)
-
-    # build vector store
-    store = VectorStore(embs, metas)
-
-    # store globals for helper usage (a light hack for small script)
-    global store_metas_glob
-    store_metas_glob = metas
-
-    # retrieval
-    q_embs = embedder.embed([args.query])
-    hits = store.query(q_embs[0], top_k=args.k)
-    contexts = [{**meta, "score": score} for meta, score in hits]
-
-    # Choose generation method
-    if _HAS_OPENAI and os.getenv("OPENAI_API_KEY"):
+    # If user provided a query, retrieve and generate
+    if args.query:
+        LOG.info("Running retrieval for query: %s", args.query)
+        matches = retrieve_contexts(store, args.query, top_k=args.top_k)
+        # Extract snippets
+        snippets = []
+        for m in matches:
+            meta = m.get("metadata", {})
+            # If we stored preview in metadata use it, or use metadata keys to recompose
+            snippet = meta.get("preview") or meta.get("text") or ""
+            snippets.append(snippet)
+        # Generate answer using OpenAI chat
+        if not snippets:
+            LOG.warning("No snippets returned from Pinecone - returning no-answer JSON")
+            out = {"answer": "", "contexts": [], "reasoning": "No matches found in vector store."}
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return
         try:
-            answer, reasoning = generate_answer_openai(args.query, contexts, texts)
+            answer, reasoning = generate_answer_with_references(args.query, snippets, model=OPENAI_CHAT_MODEL)
         except Exception as e:
-            print("OpenAI generation failed, falling back to template. Error:", e)
-            answer, reasoning = generate_answer_template(args.query, contexts, texts)
-    else:
-        answer, reasoning = generate_answer_template(args.query, contexts, texts)
+            LOG.exception("LLM generation failed; falling back to simple template")
+            # Fallback: mention the top match title if exists
+            top_meta = matches[0].get("metadata", {})
+            top_title = top_meta.get("title", "Unknown")
+            answer = f"I found plot snippets for '{top_title}', but could not generate a final answer due to an LLM error."
+            reasoning = f"Top match: {top_title}. Error: {str(e)}"
 
-    # produce contexts as text snippets for output
-    output_contexts = []
-    for c in contexts:
-        # find snippet
-        idx = None
-        for i, m in enumerate(metas):
-            if m["title"] == c["title"] and m["chunk_index"] == c["chunk_index"]:
-                idx = i
-                break
-        snippet_text = texts[idx] if idx is not None else ""
-        output_contexts.append(snippet_text)
+        out = {"answer": answer, "contexts": snippets, "reasoning": reasoning}
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
 
-    out = {"answer": answer, "contexts": output_contexts, "reasoning": reasoning}
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-
+    LOG.info("No action provided. Use --upsert to build index, or --query to run retrieval + answer.")
+    LOG.info("Example: python mini_rag_pinecone.py --csv wiki_movie_plots.csv --rows 300 --upsert")
+    LOG.info("Then: python mini_rag_pinecone.py --query 'Which movie features an AI antagonist?' --top_k 5")
 
 if __name__ == "__main__":
     main()

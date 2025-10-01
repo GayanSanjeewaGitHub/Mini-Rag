@@ -1,18 +1,5 @@
 # Mini-Rag
 
-
-pip install sentence-transformers scikit-learn pandas numpy
-# optional but recommended for speed/LLM:
-pip install faiss-cpu openai
-
-
-
-export OPENAI_API_KEY=sk-...   # optional, only if you want OpenAI
-python mini_rag.py --csv path/to/wiki_movie_plots.csv --rows 300 --k 5 --query "Which movie features an AI antagonist?"
-# Mini RAG with uv
-
-This is a minimal Retrieval-Augmented Generation (RAG) system for movie plots.
-
 ## Setup
 
 ```bash
@@ -27,3 +14,24 @@ source .venv/bin/activate  # Linux/macOS
 # install dependencies
 uv pip install -r pyproject.toml
 
+"""
+
+Minimal, production-minded RAG pipeline for Movie Plots using:
+- OpenAI for embeddings & chat completions
+- Pinecone as vector DB
+
+Features:
+- Load subset of CSV (Title, Plot)
+- Chunk long plots (words_per_chunk)
+- Create / upsert chunks to Pinecone with metadata
+- Retrieve top-k relevant chunks for a query
+- Generate JSON output: { answer, contexts, reasoning }
+- Logging, retries, error handling
+
+Usage:
+python mini_rag_pinecone.py --csv wiki_movie_plots.csv --rows 300 --upsert
+python mini_rag_pinecone.py --query "Which movie features an AI antagonist?" --top_k 5
+"""
+
+ 
+ 
