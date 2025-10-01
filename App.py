@@ -12,19 +12,12 @@ from typing import List, Dict, Tuple, Any
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from pinecone import Pinecone ,ServerlessSpec
+from dotenv import load_dotenv
+import openai
 
 # External SDKs
-try:
-    import openai
-except Exception as e:
-    raise RuntimeError("openai library is required. Install with `pip install openai`.") from e
-
-try:
-    import pinecone
-except Exception as e:
-    raise RuntimeError("pinecone-client library is required. Install with `pip install pinecone-client`.") from e
-
- 
+load_dotenv() 
 LOG = logging.getLogger("mini_rag")
 LOG.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
@@ -32,7 +25,6 @@ formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"
 handler.setFormatter(formatter)
 LOG.addHandler(handler)
 
- 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")  
@@ -49,6 +41,21 @@ if not PINECONE_API_KEY:
     raise SystemExit(1)
 
 openai.api_key = OPENAI_API_KEY
+
+
+try:
+    import openai
+except Exception as e:
+    raise RuntimeError("openai library is required. Install with `pip install openai`.") from e
+
+
+pinecone=''
+try:
+    pinecone = Pinecone(api_key="PINECONE_API_KEY")
+except Exception as e:
+    raise RuntimeError("pinecone library is required add it please. `.") from e
+
+
 
  
 def retry(fn=None, *, retries=3, delay=1.0, backoff=2.0):
@@ -90,23 +97,44 @@ class PineconeConfig:
     api_key: str
     environment: str
     index_name: str
-    dimension: int = 1536  
+    dimension: int = 1536
 
 class PineconeStore:
     def __init__(self, cfg: PineconeConfig):
         self.cfg = cfg
-        pinecone.init(api_key=cfg.api_key, environment=cfg.environment)
+        # Initialize Pinecone client
+        self.client = Pinecone(
+            api_key=cfg.api_key,
+            environment=cfg.environment
+        )
         LOG.info("Connected to Pinecone environment=%s", cfg.environment)
-        self.index = self._ensure_index(cfg.index_name, cfg.dimension)
-        self._index = pinecone.Index(cfg.index_name)
+
+        # Ensure the index exists
+        self.index_name = self._ensure_index(cfg.index_name, cfg.dimension)
+
+        # Get the Index object for upsert/query
+        self._index = self.client.Index(cfg.index_name)
 
     def _ensure_index(self, name: str, dimension: int):
-        """Create index if not exists (sparse/no replicas by default)."""
+        # print(self.client.list_indexes())
+        """Create index if it doesn't exist using ServerlessSpec."""
         try:
-            if name not in pinecone.list_indexes():
+            if name not in self.client.list_indexes()[0]["name"]:
                 LOG.info("Creating Pinecone index '%s' (dim=%d)", name, dimension)
-                pinecone.create_index(name, dimension=dimension, metric="cosine")
-                # wait briefly
+                spec = ServerlessSpec(
+                    # No need to specify region or cloud here; client already has it
+                    #replicas=1\
+                    cloud="aws",
+                    region='us-east-1'
+                    
+                )
+                self.client.create_index(
+                    name=name,
+                    dimension=dimension,
+                    metric="cosine",
+                    spec=spec
+                )
+                # Wait briefly for index to be ready
                 time.sleep(2)
             else:
                 LOG.info("Pinecone index '%s' already exists", name)
@@ -118,10 +146,8 @@ class PineconeStore:
     @retry(retries=3, delay=1.0)
     def upsert(self, vectors: List[Tuple[str, List[float], dict]]):
         """Upsert list of (id, vector, metadata)."""
-        # Pinecone supports batch upsert (list of tuples)
         try:
             LOG.info("Upserting %d vectors to Pinecone index %s", len(vectors), self.cfg.index_name)
-            # convert to list of dicts if using client v2: but pinecone.Index.upsert accepts list of tuples
             self._index.upsert(vectors=vectors)
         except Exception:
             LOG.exception("Pinecone upsert error")
@@ -131,19 +157,20 @@ class PineconeStore:
     def query(self, vector: List[float], top_k: int = 5) -> List[dict]:
         """Query Pinecone index for top_k nearest neighbors. Returns list of {id, score, metadata}."""
         try:
-            res = self._index.query(vector=vector, top_k=top_k, include_metadata=True, include_values=False)
+            res = self._index.query(
+                vector=vector,
+                top_k=top_k,
+                include_metadata=True,
+                include_values=False
+            )
             matches = res.get("matches", [])
-            out = []
-            for m in matches:
-                out.append({"id": m["id"], "score": m.get("score", 0.0), "metadata": m.get("metadata", {})})
+            out = [{"id": m["id"], "score": m.get("score", 0.0), "metadata": m.get("metadata", {})} for m in matches]
             return out
         except Exception:
             LOG.exception("Pinecone query error")
             raise
 
-# ------------------------------
-# OpenAI Helper
-# ------------------------------
+ 
 @retry(retries=3, delay=1.0)
 def embed_texts(texts: List[str], model: str = OPENAI_EMBED_MODEL) -> List[List[float]]:
     """Call OpenAI embeddings API in batches."""

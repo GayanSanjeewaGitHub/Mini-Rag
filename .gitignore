@@ -213,3 +213,6 @@ __pycache__/
 *.pyc
 
 .env
+envrag/
+/envrag
+envrag
