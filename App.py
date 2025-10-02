@@ -335,7 +335,7 @@ def parse_args():
     p.add_argument("--csv", type=str, help="Path to wiki_movie_plots CSV" ,default="data/wiki_movie_plots_deduped.csv")
     p.add_argument("--rows", type=int, default=300, help="How many rows to sample for building index")
     p.add_argument("--words_per_chunk", type=int, default=300, help="Words per chunk")
-    p.add_argument("--upsert", action="store_true", help="Run build+upsert into Pinecone" , default=True)
+    p.add_argument("--upsert", action="store_true", help="Run build+upsert into Pinecone" , default=False)
     p.add_argument("--query", type=str, help="Query to ask the RAG system (run after index exists)" , default="Which movie features an AI antagonist?")
     p.add_argument("--top_k", type=int, default=5, help="Top-k contexts to retrieve")
     p.add_argument("--batch_size", type=int, default=100, help="Upsert batch size")
