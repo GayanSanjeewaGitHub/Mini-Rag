@@ -15,6 +15,9 @@ from tqdm import tqdm
 from pinecone import Pinecone ,ServerlessSpec
 from dotenv import load_dotenv
 import openai
+import kagglehub
+import shutil
+import unicodedata
 
 # External SDKs
 load_dotenv() 
@@ -234,9 +237,7 @@ def generate_answer_with_references(query: str, snippets: List[str], model: str 
         return answer, reasoning
 
 
-import os
-import kagglehub
-import shutil
+
 
 def ensure_dataset(local_dir: str = "data"):
     """
@@ -266,9 +267,7 @@ def ensure_dataset(local_dir: str = "data"):
         print(f"✅ Found existing dataset in '{local_dir}'")
 
  
-# ------------------------------
-# Core Pipeline
-# ------------------------------
+ 
 def build_chunks_from_csv(csv_path: str, sample_rows: int = 300, words_per_chunk: int = 300) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     Loads CSV, samples rows, chunks plot texts, returns list of chunk texts and matching metadata.
@@ -314,7 +313,10 @@ def upsert_chunks_to_pinecone(store: PineconeStore, texts: List[str], metas: Lis
             meta = batch_metas[j]
             # create a stable id: e.g., title_row_chunk
             # ensure id length limits for pinecone (should be safe)
-            safe_title = meta["title"].replace(" ", "_")[:50]
+            safe_title = unicodedata.normalize('NFKD', meta["title"]) \
+                       .encode('ascii', 'ignore') \
+                       .decode('ascii') \
+                       .replace(" ", "_")[:50]
             vec_id = f"{safe_title}_r{meta['row_index']}_c{meta['chunk_index']}"
             vectors.append((vec_id, emb, meta))
         store.upsert(vectors)
@@ -327,15 +329,13 @@ def retrieve_contexts(store: PineconeStore, query: str, top_k: int = 5) -> List[
     LOG.info("Retrieved %d matches", len(matches))
     return matches
 
-# ------------------------------
-# CLI / Main
-# ------------------------------
+ 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", type=str, help="Path to wiki_movie_plots CSV" ,default="data")
+    p.add_argument("--csv", type=str, help="Path to wiki_movie_plots CSV" ,default="data/wiki_movie_plots_deduped.csv")
     p.add_argument("--rows", type=int, default=300, help="How many rows to sample for building index")
     p.add_argument("--words_per_chunk", type=int, default=300, help="Words per chunk")
-    p.add_argument("--upsert", action="store_true", help="Run build+upsert into Pinecone")
+    p.add_argument("--upsert", action="store_true", help="Run build+upsert into Pinecone" , default=True)
     p.add_argument("--query", type=str, help="Query to ask the RAG system (run after index exists)" , default="Which movie features an AI antagonist?")
     p.add_argument("--top_k", type=int, default=5, help="Top-k contexts to retrieve")
     p.add_argument("--batch_size", type=int, default=100, help="Upsert batch size")
